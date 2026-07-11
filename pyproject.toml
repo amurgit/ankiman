@@ -1,0 +1,19 @@
+[project]
+name = "ankiman"
+version = "0.1.0"
+description = "Bulk-fill Anki note fields using an LLM via AnkiConnect"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.31.0",
+    "openai>=1.0.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "typer>=0.9.0",
+]
+
+[project.scripts]
+ankiman = "ankiman:main"
+
+[tool.uv]
+package = true
