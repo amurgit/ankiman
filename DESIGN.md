@@ -153,7 +153,7 @@ Stats are logged: `Pre-scan: N eligible, M skipped (source empty), K skipped (ta
 3. **Replace**: `{Cantonese}` → actual field value from Anki
 4. **LLM call**: Send compiled prompt, retry up to 3× with randomized exponential backoff (2s base, 1-3s → 3-7s)
 5. **Parse**: `json.loads()` with fence-stripping — must contain ALL target keys (error if missing any)
-6. **Progress log**: one line per source→target pair — `Traditional → MandarinAnalogue : 我哋 → 我们`
+6. **Progress log**: one line per note — `Cantonese=嘅, SentenceCantonese=我係佢嘅朋友。 → MandarinAnalogue=的`
 7. **Write**: `updateNoteFields` with new values (skip if `-n`)
 
 Progress counter shows `[processed/eligible]`, not `[N/total]`.
