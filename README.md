@@ -110,8 +110,8 @@ Useful `fill` flags:
 - `-w`, `--wait`: seconds between batches (default 0)
 - `-b`, `--batch`: parallel LLM calls per batch (default 1 = sequential)
 - `-l`, `--limit-count`: process at most N notes (0 = all)
-- `--raw-prompt`: disable auto-generated JSON format (provide your own)
-- `-v`, `--verbose`: debug logs
+- `-r`, `--raw-prompt`: disable auto-generated JSON format (provide your own)
+- `-v`, `-vv`: debug logs (`-v` prompts+responses, `-vv` +AnkiConnect payloads)
 
 ## Prompt Format
 
@@ -137,6 +137,28 @@ Use `--raw-prompt` to provide your own complete format instructions.
 - Notes with empty source fields are skipped by default.
 - Notes with all target fields already filled are skipped unless `--force` is used.
 - Target/source fields must exist on the note type.
+- Progress shows `[processed/eligible]` — the denominator is only notes that will actually be processed.
+- Ctrl+C exits cleanly, no traceback.
+- Connection errors retry up to 3× with randomized backoff (1-3s → 3-7s).
+
+### Skip Rules
+
+**Source fields** — when a `{Field}` placeholder is empty:
+
+| Condition               | Default | With `--allow-partial-source` |
+| ----------------------- | ------- | ----------------------------- |
+| All source fields empty | Skip    | Skip                          |
+| Some empty, some filled | Skip    | Process (empty → `""`)        |
+| All filled              | Process | Process                       |
+
+**Target fields** — resume (already-filled notes are skipped):
+
+| Condition                   | Default       | With `--force`      |
+| --------------------------- | ------------- | ------------------- |
+| All target fields non-empty | Skip (resume) | Process (overwrite) |
+| Any target field empty      | Process       | Process             |
+
+No checkpoint file — resume is field-based.
 
 ## For Developers
 
@@ -144,5 +166,4 @@ Use `--raw-prompt` to provide your own complete format instructions.
 - Anki integration: [`ankiman/anki.py`](ankiman/anki.py)
 - LLM integration: [`ankiman/llm.py`](ankiman/llm.py)
 - Config and models: [`ankiman/config.py`](ankiman/config.py)
-- Design notes: [`DESIGN.md`](DESIGN.md)
 - Package config: [`pyproject.toml`](pyproject.toml)
