@@ -6,114 +6,161 @@ Bulk-fill Anki note fields using an LLM (OpenAI-compatible API) via AnkiConnect.
 
 You provide a prompt template with `{FieldName}` placeholders, and `ankiman` processes every note in a deck through the LLM, writing results back to target fields.
 
+## File layout
+
+```
+ankiman/
+├── pyproject.toml
+├── ankiman/
+│   ├── __init__.py          # re-exports main
+│   ├── cli.py               # Typer CLI, orchestration
+│   ├── anki.py              # AnkiConnect client, field helpers
+│   ├── llm.py               # LLM client, retries, DNS cache
+│   └── config.py            # config/profile read/write, env
+├── .ankiman_config.yaml     # created by `model add`
+├── .env                     # API keys (gitignored)
+├── README.md
+└── DESIGN.md
+```
+
 ## Config files
 
-**`.ankiman_config.yaml`** — named profiles (API model string, base URL, key env var)
+**`.ankiman_config.yaml`** — named models (API model string, base URL, key env var)
 
 ```yaml
 default: deepseek
 
-profiles:
+models:
   deepseek:
     model: deepseek-chat
     api_base: https://api.deepseek.com/v1
-    api_key_env: ANKI_LLM_API_KEY
+    api_key_env: DEEPSEEK_API_KEY
 ```
 
 **`.env`** — API keys loaded via `python-dotenv` (prompted interactively if missing)
 
 ```
-ANKI_LLM_API_KEY=sk-...
+DEEPSEEK_API_KEY=sk-...
 ```
+
+The env var defaults to `{NAME}_API_KEY` derived from the model name (e.g. `deepseek` → `DEEPSEEK_API_KEY`). Override with `--api-key-env` when adding.
 
 ## CLI structure
 
 ```
-ankiman [-v] {ping, deck list, profile add, fill} ...
+ankiman [-v|-vv] {ping, deck list, deck fields, model add|list|default|balance, fill} ...
 ```
 
-| Command       | Purpose                                                 |
-| ------------- | ------------------------------------------------------- |
-| `ping`        | Test AnkiConnect connection (+ optional `--check-key`)  |
-| `deck list`   | Numbered deck list for `fill -d N`                      |
-| `profile add` | Register a new profile in `.ankiman_config.yaml`        |
-| `fill`        | Bulk process notes through LLM                          |
+| Command         | Purpose                                                 |
+| --------------- | ------------------------------------------------------- |
+| `ping`          | Test AnkiConnect connection (+ optional `--check-key`)  |
+| `deck list`     | Numbered deck list for `fill -d N`                      |
+| `deck fields`   | Show field names for a deck with example values         |
+| `model add`     | Register a new model in `.ankiman_config.yaml`          |
+| `model list`    | List all configured models                              |
+| `model default` | Switch the active (default) model                       |
+| `model balance` | Check API account balance for a model                   |
+| `fill`          | Bulk process notes through LLM                          |
 
 ## Example flow
 
 ```bash
-# 1. Add a profile
-ankiman profile add deepseek \
-  -n deepseek-chat \
+# 1. Add a model
+ankiman model add deepseek \
+  -m deepseek-chat \
   --api-base https://api.deepseek.com/v1 \
   --set-default
 
 # 2. See available decks
 ankiman deck list
 
-# Output:
-#   #  Deck                                 Notes
-#   1  Default                              0
-#   2  Cantonese                            5002
+# 3. Inspect field names for a deck (shows real note values)
+ankiman deck fields -d 2
 
-# 3. Fill target fields (uses default profile)
+# 4. Dry-run to test the prompt (LLM calls but no Anki writes)
 ankiman fill \
   -d 2 \
-  -p "Translate {Traditional} to Mandarin. Return JSON: {\"Mandarin_Word\": \"...\", \"Mandarin_Sentence\": \"...\"}" \
-  -t "Mandarin_Word,Mandarin_Sentence"
+  -p "Give the Mandarin analogue for the Cantonese word {Cantonese} and sentence {SentenceCantonese}. Return JSON: {\"MandarinAnalogue\": \"...\", \"SentenceMandarinAnalogue\": \"...\"}" \
+  -t MandarinAnalogue,SentenceMandarinAnalogue \
+  -n
 
-# 4. Specify a config explicitly
-ankiman fill -d 2 -p "..." -t "Mandarin_Word" -c deepseek
+# 5. Fill for real (uses default model)
+ankiman fill -d 2 -p "..." -t MandarinAnalogue,SentenceMandarinAnalogue
 
-# 5. Dry run (LLM calls but no Anki writes)
-ankiman fill -d 2 -p "..." -t "Mandarin_Word" -n
+# 6. Limit to 10 notes for testing
+ankiman fill -d 2 -p "..." -t MandarinAnalogue -l 10
 
-# 6. Force re-fill already-filled notes
-ankiman fill -d 2 -p "..." -t "Mandarin_Word" -f
+# 7. Parallel mode — 5 LLM calls at once
+ankiman fill -d 2 -p "..." -t MandarinAnalogue -b 5
+
+# 8. Override model for one run
+ankiman fill -d 2 -p "..." -t MandarinAnalogue -c openai
+
+# 9. Force re-fill already-filled notes
+ankiman fill -d 2 -p "..." -t MandarinAnalogue -f
 ```
 
 ## `fill` flags
 
-| Long                     | Short | Default             | Purpose                                                                 |
-| ------------------------ | ----- | ------------------- | ----------------------------------------------------------------------- |
-| `--deck`                 | `-d`  | required            | Deck index (from `deck list`) or exact name                             |
-| `--prompt`               | `-p`  | required            | Template with `{Field}` placeholders — sources auto-extracted via regex |
-| `--target-fields`        | `-t`  | required            | Comma-separated Anki fields to write LLM output into                    |
-| `--config`               | `-c`  | YAML `default:`     | Profile name from `.ankiman_config.yaml`                                |
-| `--force`                | `-f`  | false               | Re-process even if all target fields already have content               |
-| `--allow-partial-source` |       | false               | Process when some (not all) source fields are filled                    |
-| `--dry-run`              | `-n`  | false               | Call LLM but do not write to Anki                                       |
-| `--delay`                |       | 0.3                 | Seconds between API calls                                               |
-| `--model-name`           |       |                     | One-off override of API model string for this run                       |
-| `--api-base`             |       |                     | One-off override of API base URL for this run                           |
+| Long                     | Short | Default          | Purpose                                                                 |
+| ------------------------ | ----- | ---------------- | ----------------------------------------------------------------------- |
+| `--deck`                 | `-d`  | required         | Deck index (from `deck list`) or exact name                             |
+| `--prompt`               | `-p`  | required         | Template with `{Field}` placeholders — sources auto-extracted via regex |
+| `--target-fields`        | `-t`  | required         | Comma-separated Anki fields to write LLM output into                    |
+| `--config`               | `-c`  | YAML `default:`  | Model name from `.ankiman_config.yaml`                                  |
+| `--force`                | `-f`  | false            | Re-process even if all target fields already have content               |
+| `--allow-partial-source` |       | false            | Process when some (not all) source fields are filled                    |
+| `--dry-run`              | `-n`  | false            | Call LLM but do not write to Anki                                       |
+| `--wait`                 | `-w`  | 0                | Seconds between batches                                                 |
+| `--batch`                | `-b`  | 1                | Parallel LLM calls per batch (1 = sequential)                           |
+| `--limit-count`          | `-l`  | 0                | Process at most N notes (0 = no limit)                                  |
+| `--model-name`           |       |                  | One-off override of API model string for this run                       |
+| `--api-base`             |       |                  | One-off override of API base URL for this run                           |
 
-## `profile add` flags
+## `model add` flags
 
-| Argument        | Short      | Default            | Purpose                               |
-| --------------- | ---------- | ------------------ | ------------------------------------- |
-| `name`          | positional | required           | Profile name (used with `fill -c`)    |
-| `--profile-name` | `-n`      | required           | API model string (e.g. `deepseek-chat`) |
-| `--api-base`    |            | required           | OpenAI-compatible base URL            |
-| `--api-key-env` |            | `ANKI_LLM_API_KEY` | Environment variable for the API key  |
-| `--set-default` |            | false              | Set as default profile in config      |
-| `--force`       |            | false              | Overwrite existing profile name       |
+| Argument       | Short  | Default | Purpose                               |
+| -------------- | ------ | ------- | ------------------------------------- |
+| `name`         | pos    | required| Model name (used with `fill -c`)      |
+| `--model`      | `-m`   | required| API model string (e.g. `deepseek-chat`)|
+| `--api-base`   |        | required| OpenAI-compatible base URL            |
+| `--api-key-env`|        | derived | Env var for API key (default: `{NAME}_API_KEY`) |
+| `--set-default`|        | false   | Set as default model in config        |
+| `--force`      |        | false   | Overwrite existing model name         |
 
 ## `ping` flags
 
 | Flag          | Purpose                                       |
 | ------------- | --------------------------------------------- |
-| `--check-key` | Verify API key is set for the selected profile |
-| `--config`    | Profile name (optional, uses default)          |
+| `--check-key` | Verify API key is set for the selected model  |
+| `--config`    | Model name (optional, uses default)           |
 
-## Processing logic per note
+## Processing logic
 
-1. **Skip check (source)**: If any source field `{Field}` is empty → skip (unless `--allow-partial-source`)
+### Pre-scan
+
+Before any LLM calls, all notes are scanned to count:
+- **skipped (source)**: notes with empty `{Field}` placeholders
+- **skipped (target)**: notes with all target fields already filled
+- **eligible**: notes that will actually be processed
+
+Stats are logged: `Pre-scan: N eligible, M skipped (source empty), K skipped (target filled)`.
+
+### Per note (sequential or parallel batch)
+
+1. **Skip check (source)**: If any source field is empty → skip (unless `--allow-partial-source`)
 2. **Skip check (target)**: If all target fields already filled → skip (unless `-f`)
-3. **Replace**: `{Traditional}` → actual field value from Anki
-4. **LLM call**: Send compiled prompt, retry up to 3× with exponential backoff
-5. **Parse**: `json.loads()` the response — strict, must contain ALL target keys (error if missing any)
-6. **Write**: `updateNoteFields` with new values (skip if `-n`)
-7. **Log**: `[N/TOTAL] note=... source preview -> target preview`
+3. **Replace**: `{Cantonese}` → actual field value from Anki
+4. **LLM call**: Send compiled prompt, retry up to 3× with randomized exponential backoff (2s base, 1-3s → 3-7s)
+5. **Parse**: `json.loads()` with fence-stripping — must contain ALL target keys (error if missing any)
+6. **Progress log**: one line per source→target pair — `Traditional → MandarinAnalogue : 我哋 → 我们`
+7. **Write**: `updateNoteFields` with new values (skip if `-n`)
+
+Progress counter shows `[processed/eligible]`, not `[N/total]`.
+
+### Batch mode (`-b N`)
+
+When `--batch` > 1, N prompt+LLM requests run in parallel via `ThreadPoolExecutor`. Anki updates and logging remain sequential. Ctrl+C cancels pending futures and exits cleanly via `os._exit`.
 
 ## Skip rules detail
 
@@ -134,18 +181,21 @@ ankiman fill -d 2 -p "..." -t "Mandarin_Word" -f
 
 No separate checkpoint file — resume is field-based.
 
-## Logging output example
+## Verbosity levels
 
-```
-INFO    Deck 'Cantonese': 5002 notes, sources=['Traditional'], targets=['Mandarin_Word', 'Mandarin_Sentence'], profile=deepseek
-INFO    [12/5002] note=1776774735423 Traditional='你好' -> Mandarin_Word='你好', Mandarin_Sentence='你好，世界'
-WARNING Skipping note 1776774735424: source field 'Traditional' is empty
-WARNING Skipping note 1776774735425: all target fields already filled
-ERROR   Note 1776774735426: JSON missing required key(s): Mandarin_Sentence
-INFO    Done. processed=4500 skipped=480 errors=22 total=5002
-```
+| Flag   | Level   | Shows                                      |
+| ------ | ------- | ------------------------------------------ |
+| (none) | INFO    | Progress lines, errors, summary            |
+| `-v`   | DETAIL  | + prompts sent and raw LLM responses       |
+| `-vv`  | DEBUG   | + AnkiConnect payloads, retry timing       |
 
-`-v` (verbose) shows all `DEBUG` logs: full prompts sent, raw LLM responses, AnkiConnect payloads, skip decisions.
+## Error handling
+
+- **DNS**: `socket.getaddrinfo` is monkey-patched with a per-run cache — hostnames resolve once.
+- **FD leaks**: `resp.close()` is called explicitly after every HTTP request. `RLIMIT_NOFILE` is raised to 4096 on startup.
+- **EMFILE diagnostics**: when `[Errno 24] Too many open files` is detected, current open FD count and limits are logged.
+- **Ctrl+C**: `SIGINT` handler calls `os._exit(1)` immediately — no threading traceback.
+- **AnkiConnect errors**: caught and shown as user-facing messages (no stacktraces).
 
 ## Dependencies
 
@@ -159,16 +209,4 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
 ]
-```
-
-## File layout
-
-```
-ankiman/
-├── pyproject.toml
-├── ankiman/
-│   └── __init__.py          # all logic + CLI
-├── .ankiman_config.yaml     # created by `profile add`
-├── .env                     # API keys (gitignored)
-└── DESIGN.md
 ```
