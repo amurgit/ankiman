@@ -55,14 +55,16 @@ uv run ankiman deck list
 uv run ankiman deck fields -d 2
 ```
 
-7. Fill fields:
+7. Fill fields. Example: generate Mandarin analogues for Cantonese words and sentences. Deck `Cantonese HSK 1-5` has fields `Cantonese`, `SentenceCantonese`, `MandarinAnalogue`, `SentenceMandarinAnalogue`.
 
 ```bash
 uv run ankiman fill \
-  -d 2 \
-  -p 'Translate {Traditional} to Mandarin. Return JSON: {"Mandarin_Word": "...", "Mandarin_Sentence": "..."}' \
-  -t Mandarin_Word,Mandarin_Sentence
+  -d Cantonese\ HSK\ 1-5 \
+  -p 'Give the Mandarin analogue for the Cantonese word {Cantonese} and sentence {SentenceCantonese}. Return JSON: {"MandarinAnalogue": "...", "SentenceMandarinAnalogue": "..."}' \
+  -t MandarinAnalogue,SentenceMandarinAnalogue
 ```
+
+`{Cantonese}` and `{SentenceCantonese}` are replaced with real note values. The LLM returns JSON with `MandarinAnalogue` and `SentenceMandarinAnalogue`, which `ankiman` writes back to Anki.
 
 If the API key is missing, `ankiman` asks for it and saves it to `.env`.
 
@@ -92,7 +94,7 @@ DEEPSEEK_API_KEY=sk-...
 uv run ankiman ping
 uv run ankiman deck list
 uv run ankiman deck fields -d DECK
-uv run ankiman model add PROFILE --model MODEL --api-base URL [--set-default]
+uv run ankiman model add MODEL --model API_MODEL --api-base URL [--set-default]
 uv run ankiman model list
 uv run ankiman model default NAME
 uv run ankiman model balance [-c MODEL]
@@ -117,8 +119,9 @@ Find field names first with `uv run ankiman deck fields -d DECK`.
 Use Anki fields as placeholders:
 
 ```text
-Translate {Traditional} to Mandarin. Return JSON:
-{"Mandarin_Word": "...", "Mandarin_Sentence": "..."}
+Give the Mandarin analogue for the Cantonese word {Cantonese}
+and sentence {SentenceCantonese}. Return JSON:
+{"MandarinAnalogue": "...", "SentenceMandarinAnalogue": "..."}
 ```
 
 The model must return valid JSON with all target fields.
