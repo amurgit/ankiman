@@ -135,9 +135,9 @@ The model must return valid JSON with all target fields.
 
 ## For Developers
 
-- CLI: [`ankiman/cli.py`](file:///Users/avkolupaev/ankiman/ankiman/cli.py)
-- Anki integration: [`ankiman/anki.py`](file:///Users/avkolupaev/ankiman/ankiman/anki.py)
-- LLM integration: [`ankiman/llm.py`](file:///Users/avkolupaev/ankiman/ankiman/llm.py)
-- Config and models: [`ankiman/config.py`](file:///Users/avkolupaev/ankiman/ankiman/config.py)
-- Design notes: [`DESIGN.md`](file:///Users/avkolupaev/ankiman/DESIGN.md)
-- Package config: [`pyproject.toml`](file:///Users/avkolupaev/ankiman/pyproject.toml)
+- CLI: [`ankiman/cli.py`](ankiman/cli.py)
+- Anki integration: [`ankiman/anki.py`](ankiman/anki.py)
+- LLM integration: [`ankiman/llm.py`](ankiman/llm.py)
+- Config and models: [`ankiman/config.py`](ankiman/config.py)
+- Design notes: [`DESIGN.md`](DESIGN.md)
+- Package config: [`pyproject.toml`](pyproject.toml)
