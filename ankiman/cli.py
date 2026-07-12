@@ -268,6 +268,8 @@ def _do_fill(
         json_template = json.dumps({f: "..." for f in tfields})
         prompt = f"{prompt}\nReturn JSON: {json_template}"
 
+    logger.info("Prompt:\n{}", prompt)
+
     client = AnkiConnectClient()
     deck_name = resolve_deck_name(client, deck)
     note_ids = client.find_notes(f'deck:"{deck_name}"')
