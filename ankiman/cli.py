@@ -224,19 +224,11 @@ def _process_result(
         return
     stats.processed += 1
 
-    for i, sname in enumerate(sfields):
-        tname = tfields[i] if i < len(tfields) else "?"
-        tag = "[DRY RUN]" if dry_run else ""
-        counter = f"[{stats.processed}/{eligible}]" if i == 0 else " " * len(f"[{stats.processed}/{eligible}]")
-        logger.info(
-            "{} {}{:<22} → {:<28} : {} → {}",
-            counter,
-            tag + " " if tag else "",
-            sname,
-            tname,
-            preview_field_text(fields.get(sname, "")),
-            preview_field_text(updates.get(tname, "")),
-        )
+    tag = "[DRY RUN] " if dry_run else ""
+    counter = f"[{stats.processed}/{eligible}]"
+    source_str = ", ".join(f"{name}={preview_field_text(fields.get(name, ''))}" for name in sfields)
+    target_str = ", ".join(f"{name}={preview_field_text(updates.get(name, ''))}" for name in tfields)
+    logger.info("{} {} {} -> {}", counter, tag, source_str, target_str)
 
     if not dry_run:
         try:
