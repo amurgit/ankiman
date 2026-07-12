@@ -1,7 +1,7 @@
 default: deepseek
 
-profiles:
+models:
   deepseek:
     model: deepseek-chat
     api_base: https://api.deepseek.com/v1
-    api_key_env: ANKI_LLM_API_KEY
+    api_key_env: DEEPSEEK_API_KEY
