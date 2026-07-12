@@ -55,16 +55,16 @@ uv run ankiman deck list
 uv run ankiman deck fields -d 2
 ```
 
-7. Fill fields. Example: generate Mandarin analogues for Cantonese words and sentences. Deck `Cantonese HSK 1-5` has fields `Cantonese`, `SentenceCantonese`, `MandarinAnalogue`, `SentenceMandarinAnalogue`.
+7. Fill fields. Example: generate Mandarin analogues for Cantonese words. Deck `_Cantonese HSK 1-5` has fields `Cantonese`, `MandarinAnalogue`.
 
 ```bash
 uv run ankiman fill \
-  -d Cantonese\ HSK\ 1-5 \
-  -p 'Give the Mandarin analogue for the Cantonese word {Cantonese} and sentence {SentenceCantonese}. Return JSON: {"MandarinAnalogue": "...", "SentenceMandarinAnalogue": "..."}' \
-  -t MandarinAnalogue,SentenceMandarinAnalogue
+  -d _Cantonese\ HSK\ 1-5 \
+  -p 'Give the Mandarin analogue for the Cantonese word {Cantonese}' \
+  -t MandarinAnalogue
 ```
 
-`{Cantonese}` and `{SentenceCantonese}` are replaced with real note values. The LLM returns JSON with `MandarinAnalogue` and `SentenceMandarinAnalogue`, which `ankiman` writes back to Anki.
+`{Cantonese}` is replaced with real note values. The JSON format `{"MandarinAnalogue": "..."}` is auto-generated from `--target-fields`. The LLM response is parsed and written back to Anki. Use `--raw-prompt` to provide your own format instructions.
 
 If the API key is missing, `ankiman` asks for it and saves it to `.env`.
 
@@ -110,6 +110,7 @@ Useful `fill` flags:
 - `-w`, `--wait`: seconds between batches (default 0)
 - `-b`, `--batch`: parallel LLM calls per batch (default 1 = sequential)
 - `-l`, `--limit-count`: process at most N notes (0 = all)
+- `--raw-prompt`: disable auto-generated JSON format (provide your own)
 - `-v`, `--verbose`: debug logs
 
 ## Prompt Format
@@ -119,12 +120,16 @@ Find field names first with `uv run ankiman deck fields -d DECK`.
 Use Anki fields as placeholders:
 
 ```text
-Give the Mandarin analogue for the Cantonese word {Cantonese}
-and sentence {SentenceCantonese}. Return JSON:
-{"MandarinAnalogue": "...", "SentenceMandarinAnalogue": "..."}
+Give the Mandarin analogue for the Cantonese word {Cantonese}.
 ```
 
-The model must return valid JSON with all target fields.
+The JSON format is auto-generated from `--target-fields`. For example, `-t MandarinAnalogue` appends:
+
+```text
+Return JSON: {"MandarinAnalogue": "..."}
+```
+
+Use `--raw-prompt` to provide your own complete format instructions.
 
 ## Notes
 

@@ -251,6 +251,7 @@ def _do_fill(
     api_base: str | None = None,
     count: int = 0,
     batch: int = 1,
+    raw_prompt: bool = False,
 ) -> None:
     app_cfg = load_config()
     model_cfg = app_cfg.resolve(config)
@@ -260,6 +261,12 @@ def _do_fill(
         raise SystemExit("--target-fields must list at least one field")
     if not sfields:
         logger.warning("Prompt contains no {{Field}} placeholders")
+
+    if not raw_prompt:
+        import json
+
+        json_template = json.dumps({f: "..." for f in tfields})
+        prompt = f"{prompt}\nReturn JSON: {json_template}"
 
     client = AnkiConnectClient()
     deck_name = resolve_deck_name(client, deck)
@@ -505,19 +512,23 @@ def fill(
     model_name: str | None = typer.Option(None, "--model-name", help="Override API model string for this run"),
     api_base: str | None = typer.Option(None, "--api-base", help="Override API base URL for this run"),
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to process (0 = no limit)"),
+    raw_prompt: bool = typer.Option(False, "--raw-prompt", help="Disable auto-generated JSON instruction in prompt"),
 ) -> None:
     """Fill target fields from LLM responses.
 
     \b
     Example:
       ankiman fill -d 2 \\
-          -p 'Translate {Traditional} to Mandarin. Return JSON: {"Mandarin_Word": "..."}' \\
-          -t Mandarin_Word
+          -p 'Translate {Cantonese} to Mandarin' \\
+          -t MandarinAnalogue
+
+    The JSON format instruction is auto-generated from --target-fields.
+    Use --raw-prompt to provide your own format instructions.
 
     Find deck numbers with: ankiman deck list
     Find field names with:      ankiman deck fields -d DECK
     """
-    _do_fill(deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run, model_name, api_base, count, batch)
+    _do_fill(deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run, model_name, api_base, count, batch, raw_prompt)
 
 
 def main() -> None:

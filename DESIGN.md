@@ -80,12 +80,12 @@ ankiman deck fields -d 2
 # 4. Dry-run to test the prompt (LLM calls but no Anki writes)
 ankiman fill \
   -d 2 \
-  -p "Give the Mandarin analogue for the Cantonese word {Cantonese} and sentence {SentenceCantonese}. Return JSON: {\"MandarinAnalogue\": \"...\", \"SentenceMandarinAnalogue\": \"...\"}" \
-  -t MandarinAnalogue,SentenceMandarinAnalogue \
+  -p "Give the Mandarin analogue for the Cantonese word {Cantonese}" \
+  -t MandarinAnalogue \
   -n
 
 # 5. Fill for real (uses default model)
-ankiman fill -d 2 -p "..." -t MandarinAnalogue,SentenceMandarinAnalogue
+ankiman fill -d 2 -p "Give Mandarin analogue for {Cantonese}" -t MandarinAnalogue
 
 # 6. Limit to 10 notes for testing
 ankiman fill -d 2 -p "..." -t MandarinAnalogue -l 10
@@ -98,6 +98,9 @@ ankiman fill -d 2 -p "..." -t MandarinAnalogue -c openai
 
 # 9. Force re-fill already-filled notes
 ankiman fill -d 2 -p "..." -t MandarinAnalogue -f
+
+# 10. Raw prompt — provide your own JSON format
+ankiman fill -d 2 -p "Give Mandarin analogue for {Cantonese}. Return JSON: {\"MandarinAnalogue\": \"...\", \"MandarinSentence\": \"...\"}" -t MandarinAnalogue,MandarinSentence --raw-prompt
 ```
 
 ## `fill` flags
@@ -114,6 +117,7 @@ ankiman fill -d 2 -p "..." -t MandarinAnalogue -f
 | `--wait`                 | `-w`  | 0                | Seconds between batches                                                 |
 | `--batch`                | `-b`  | 1                | Parallel LLM calls per batch (1 = sequential)                           |
 | `--limit-count`          | `-l`  | 0                | Process at most N notes (0 = no limit)                                  |
+| `--raw-prompt`           |       | false            | Disable auto-generated JSON format instruction                          |
 | `--model-name`           |       |                  | One-off override of API model string for this run                       |
 | `--api-base`             |       |                  | One-off override of API base URL for this run                           |
 
@@ -150,7 +154,7 @@ Stats are logged: `Pre-scan: N eligible, M skipped (source empty), K skipped (ta
 
 1. **Skip check (source)**: If any source field is empty → skip (unless `--allow-partial-source`)
 2. **Skip check (target)**: If all target fields already filled → skip (unless `-f`)
-3. **Replace**: `{Cantonese}` → actual field value from Anki
+3. **Replace**: `{Cantonese}` → actual field value from Anki. JSON format is auto-appended from `--target-fields` (unless `--raw-prompt`).
 4. **LLM call**: Send compiled prompt, retry up to 3× with randomized exponential backoff (2s base, 1-3s → 3-7s)
 5. **Parse**: `json.loads()` with fence-stripping — must contain ALL target keys (error if missing any)
 6. **Progress log**: one line per note — `Cantonese=嘅, SentenceCantonese=我係佢嘅朋友。 → MandarinAnalogue=的`
