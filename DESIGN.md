@@ -117,7 +117,7 @@ ankiman fill -d 2 -p "Give Mandarin analogue for {Cantonese}. Return JSON: {\"Ma
 | `--wait`                 | `-w`  | 0                | Seconds between batches                                                 |
 | `--batch`                | `-b`  | 1                | Parallel LLM calls per batch (1 = sequential)                           |
 | `--limit-count`          | `-l`  | 0                | Process at most N notes (0 = no limit)                                  |
-| `--raw-prompt`           |       | false            | Disable auto-generated JSON format instruction                          |
+| `--raw-prompt`           | `-r`  | false            | Disable auto-generated JSON format instruction                          |
 | `--model-name`           |       |                  | One-off override of API model string for this run                       |
 | `--api-base`             |       |                  | One-off override of API base URL for this run                           |
 

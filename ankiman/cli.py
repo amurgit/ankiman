@@ -268,7 +268,7 @@ def _do_fill(
         json_template = json.dumps({f: "..." for f in tfields})
         prompt = f"{prompt}\nReturn JSON: {json_template}"
 
-    logger.info("Prompt:\n{}", prompt)
+    logger.info(f"Prompt:\n{prompt!r}", )
 
     client = AnkiConnectClient()
     deck_name = resolve_deck_name(client, deck)
@@ -514,7 +514,7 @@ def fill(
     model_name: str | None = typer.Option(None, "--model-name", help="Override API model string for this run"),
     api_base: str | None = typer.Option(None, "--api-base", help="Override API base URL for this run"),
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to process (0 = no limit)"),
-    raw_prompt: bool = typer.Option(False, "--raw-prompt", help="Disable auto-generated JSON instruction in prompt"),
+    raw_prompt: bool = typer.Option(False, "-r", "--raw-prompt", help="Disable auto-generated JSON instruction in prompt"),
 ) -> None:
     """Fill target fields from LLM responses.
 
