@@ -15,8 +15,8 @@ ENV_FILENAME = ".env"
 logger = structlog.get_logger()
 
 
-def default_env_var(model_name: str) -> str:
-    return f"{model_name}_API_KEY".upper()
+def default_env_var(name: str) -> str:
+    return f"{name}_API_KEY".upper()
 
 
 @dataclass
@@ -69,9 +69,9 @@ def load_config(path: Path | None = None) -> AppConfig:
     for name, entry in models_raw.items():
         if not isinstance(entry, dict):
             raise SystemExit(f"Invalid model entry {name!r} in {path}")
-        for field in ("model", "api_base"):
-            if field not in entry:
-                raise SystemExit(f"Model {name!r} missing required field {field!r}")
+        for req in ("model", "api_base"):
+            if req not in entry:
+                raise SystemExit(f"Model {name!r} missing required field {req!r}")
         models[name] = ModelConfig(
             name=name,
             model=str(entry["model"]),

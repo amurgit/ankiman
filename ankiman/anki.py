@@ -7,7 +7,7 @@ from html import unescape
 from typing import Any
 
 import requests
-from loguru import logger
+import structlog
 
 ANKI_CONNECT_URL = "http://localhost:8765"
 ANKI_CONNECT_VERSION = 6
@@ -15,6 +15,19 @@ NOTES_INFO_BATCH = 100
 HTML_BREAK_RE = re.compile(r"(?i)<br\s*/?>")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
+
+logger = structlog.get_logger()
+
+
+def _fmt_params(params: dict[str, Any]) -> str:
+    """Format params for debug logging, truncating large lists."""
+    result: dict[str, Any] = {}
+    for key, value in params.items():
+        if isinstance(value, list) and len(value) > 5:
+            result[key] = f"[{len(value)} items]"
+        else:
+            result[key] = value
+    return str(result)
 
 
 class AnkiConnectError(Exception):
@@ -27,10 +40,12 @@ class AnkiConnectClient:
         self.api_version = api_version
 
     def invoke(self, action: str, **params: Any) -> Any:
+        _log = params.pop("_log", True)
         payload: dict[str, Any] = {"action": action, "version": self.api_version}
         if params:
             payload["params"] = params
-        logger.debug("AnkiConnect {} params={}", action, params)
+        if _log:
+            logger.debug(f"AnkiConnect {action} params={_fmt_params(params)}")
         resp = None
         try:
             resp = requests.post(self.url, json=payload, timeout=60)
@@ -40,7 +55,7 @@ class AnkiConnectClient:
                 try:
                     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
                     fd_count = len(os.listdir("/dev/fd"))
-                    logger.warning("AnkiConnect FD diagnostic: open={} soft_limit={} hard_limit={}", fd_count, soft, hard)
+                    logger.warning(f"AnkiConnect FD diagnostic: open={fd_count} soft_limit={soft} hard_limit={hard}")
                 except Exception:
                     pass
             raise AnkiConnectError(
@@ -64,14 +79,35 @@ class AnkiConnectClient:
     def notes_info(self, note_ids: list[int]) -> list[dict[str, Any]]:
         if not note_ids:
             return []
+        batches = (len(note_ids) + NOTES_INFO_BATCH - 1) // NOTES_INFO_BATCH
+        logger.debug(f"AnkiConnect notesInfo ({batches} batch(es), {len(note_ids)} notes)")
         results: list[dict[str, Any]] = []
         for i in range(0, len(note_ids), NOTES_INFO_BATCH):
             batch = note_ids[i : i + NOTES_INFO_BATCH]
-            results.extend(self.invoke("notesInfo", notes=batch))
+            results.extend(self.invoke("notesInfo", _log=False, notes=batch))
         return results
 
     def update_note_fields(self, note_id: int, fields: dict[str, str]) -> None:
         self.invoke("updateNoteFields", note={"id": note_id, "fields": fields})
+
+    def add_tags(self, note_ids: list[int], tags: list[str]) -> None:
+        if not note_ids or not tags:
+            return
+        self.invoke("addTags", notes=note_ids, tags=" ".join(tags))
+
+    def remove_tags(self, note_ids: list[int], tags: list[str]) -> None:
+        if not note_ids or not tags:
+            return
+        self.invoke("removeTags", notes=note_ids, tags=" ".join(tags))
+
+    def store_media_file(self, filename: str, data: bytes) -> None:
+        import base64
+
+        self.invoke(
+            "storeMediaFile",
+            filename=filename,
+            data=base64.b64encode(data).decode("ascii"),
+        )
 
 
 def resolve_deck_name(client: AnkiConnectClient, deck_arg: str) -> str:

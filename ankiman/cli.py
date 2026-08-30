@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import resource
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -20,47 +19,15 @@ from .anki import (
     preview_field_text,
     resolve_deck_name,
 )
+from .audio import _do_audio_fill, _do_audio_test
 from .config import AppConfig, ModelConfig, config_path, default_env_var, ensure_api_key, load_config, reset_config, save_config
 from .secrets import delete_secret, secret_backend_name, set_secret
-from .note_filter import filter_notes
+from .note_filter import compile_note_filter, filter_notes, note_matches, resolve_show_fields
 from .llm import LLMClient, check_balance, parse_ai_response, verify_api_access
-
-PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+from .tts import DEFAULT_VOICES, LANGUAGE_ALIASES, language_choices, resolve_voice
+from .util import FillStats, build_anki_query, extract_source_fields, parse_comma_list, replace_placeholders
 
 logger = structlog.get_logger()
-
-
-def extract_source_fields(prompt: str) -> list[str]:
-    seen: set[str] = set()
-    fields: list[str] = []
-    for match in PLACEHOLDER_RE.finditer(prompt):
-        name = match.group(1)
-        if name not in seen:
-            seen.add(name)
-            fields.append(name)
-    return fields
-
-
-def replace_placeholders(text: str, field_map: dict[str, str]) -> str:
-    def repl(match: re.Match[str]) -> str:
-        return field_map.get(match.group(1), "")
-
-    return PLACEHOLDER_RE.sub(repl, text)
-
-
-def parse_comma_list(value: str) -> list[str]:
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
-def build_anki_query(deck: str | None, tags: list[str] | None) -> str:
-    """Build an AnkiConnect search query from deck name and/or tags."""
-    parts: list[str] = []
-    if deck:
-        parts.append(f'deck:"{deck}"')
-    if tags:
-        tag_clauses = " OR ".join(f'tag:"{t}"' for t in tags)
-        parts.append(f"({tag_clauses})")
-    return " ".join(parts)
 
 
 def count_nonempty(values: dict[str, str], names: list[str]) -> int:
@@ -117,15 +84,6 @@ def validate_target_fields(
                     f"Create fields in the Anki app (Tools → Manage Note Types → Fields) "
                     f"before running fill."
                 )
-
-
-@dataclass
-class FillStats:
-    total: int = 0
-    processed: int = 0
-    skipped: int = 0
-    errors: int = 0
-
 
 
 def _do_ping(check_key: bool, config: str | None) -> None:
@@ -304,6 +262,10 @@ def _process_result(
     stats: FillStats,
     eligible: int,
     client: AnkiConnectClient,
+    *,
+    validate_filter: Any = None,
+    tag_add: list[str] | None = None,
+    tag_delete: list[str] | None = None,
 ) -> None:
     logger.debug(f"Note {note_id} raw response:\n{raw}")
     try:
@@ -312,6 +274,14 @@ def _process_result(
         stats.errors += 1
         logger.error(f"Note {note_id}: {exc}")
         return
+
+    if validate_filter is not None:
+        merged = {**fields, **updates}
+        if not note_matches(validate_filter, merged):
+            stats.errors += 1
+            logger.error(f"Note {note_id}: validation failed (--validate-filter)")
+            return
+
     stats.processed += 1
 
     tag = "[DRY RUN] " if dry_run else ""
@@ -320,12 +290,18 @@ def _process_result(
     target_kwargs = {f"→{name}": preview_field_text(updates.get(name, '')) for name in tfields}
     logger.info(f"{counter} {tag}", **source_kwargs, **target_kwargs)
 
-    if not dry_run:
-        try:
-            client.update_note_fields(note_id, updates)
-        except AnkiConnectError as exc:
-            stats.errors += 1
-            logger.error(f"Failed to update note {note_id}: {exc}")
+    if dry_run:
+        return
+
+    try:
+        client.update_note_fields(note_id, updates)
+        if tag_add:
+            client.add_tags([note_id], tag_add)
+        if tag_delete:
+            client.remove_tags([note_id], tag_delete)
+    except AnkiConnectError as exc:
+        stats.errors += 1
+        logger.error(f"Failed to update note {note_id}: {exc}")
 
 
 def _do_fill(
@@ -343,12 +319,19 @@ def _do_fill(
     batch: int = 1,
     raw_prompt: bool = False,
     tags: str | None = None,
+    filter_expr: str | None = None,
+    tag_add: str | None = None,
+    tag_delete: str | None = None,
+    validate_filter_expr: str | None = None,
 ) -> None:
     app_cfg = load_config()
     model_cfg = app_cfg.resolve(config)
     tfields = parse_comma_list(target_fields)
     sfields = extract_source_fields(prompt)
     tag_list = parse_comma_list(tags) if tags else None
+    tag_add_list = parse_comma_list(tag_add) if tag_add else []
+    tag_delete_list = parse_comma_list(tag_delete) if tag_delete else []
+    validate_filter = compile_note_filter(validate_filter_expr) if validate_filter_expr else None
     if not tfields:
         raise SystemExit("--target-fields must list at least one field")
     if not sfields:
@@ -374,6 +357,15 @@ def _do_fill(
         return
 
     notes = client.notes_info(note_ids)
+    total_before_filter = len(notes)
+    if filter_expr:
+        notes = filter_notes(notes, filter_expr)
+        logger.info(f"Filter matched {len(notes)}/{total_before_filter} note(s)")
+
+    if not notes:
+        logger.info("No notes matched filter")
+        return
+
     validate_target_fields(notes, tfields, sfields)
     total_notes = len(notes)
 
@@ -446,7 +438,12 @@ def _do_fill(
                 stats.errors += 1
                 logger.error(f"Note {note_id}: {exc}")
                 continue
-            _process_result(note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client)
+            _process_result(
+                note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client,
+                validate_filter=validate_filter,
+                tag_add=tag_add_list,
+                tag_delete=tag_delete_list,
+            )
         else:
             # Parallel batch
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -467,7 +464,12 @@ def _do_fill(
                         stats.errors += 1
                         logger.error(f"Note {note_id}: {exc}")
                         continue
-                    _process_result(note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client)
+                    _process_result(
+                note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client,
+                validate_filter=validate_filter,
+                tag_add=tag_add_list,
+                tag_delete=tag_delete_list,
+            )
             except KeyboardInterrupt:
                 for f in futures:
                     f.cancel()
@@ -496,9 +498,11 @@ app = typer.Typer(no_args_is_help=True)
 config_app = typer.Typer(no_args_is_help=True)
 deck_app = typer.Typer(no_args_is_help=True)
 model_app = typer.Typer(no_args_is_help=True)
+audio_app = typer.Typer(no_args_is_help=True)
 app.add_typer(config_app, name="config", help="Manage ankiman config")
 app.add_typer(deck_app, name="deck", help="Deck operations")
 app.add_typer(model_app, name="model", help="Manage LLM models")
+app.add_typer(audio_app, name="audio", help="Generate audio with edge-tts")
 
 
 @app.command()
@@ -663,6 +667,19 @@ def fill(
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to process (0 = no limit)"),
     raw_prompt: bool = typer.Option(False, "-r", "--raw-prompt", help="Disable auto-generated JSON instruction in prompt"),
     tags: str | None = typer.Option(None, "-g", "--tags", help="Filter by tags (comma-separated, OR logic)"),
+    filter_expr: str | None = typer.Option(
+        None,
+        "-F",
+        "--filter",
+        help="Jinja filter on field values (applied before LLM)",
+    ),
+    tag_add: str | None = typer.Option(None, "-ta", "--tag-add", help="Add tag(s) after successful write (comma-separated)"),
+    tag_delete: str | None = typer.Option(None, "-td", "--tag-delete", help="Remove tag(s) after successful write"),
+    validate_filter_expr: str | None = typer.Option(
+        None,
+        "--validate-filter",
+        help="Jinja filter on merged fields after LLM; reject update if false",
+    ),
 ) -> None:
     """Fill target fields from LLM responses.
 
@@ -678,7 +695,11 @@ def fill(
     Find deck numbers with: ankiman deck list
     Find field names with:      ankiman deck fields -d DECK
     """
-    _do_fill(deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run, model_name, api_base, count, batch, raw_prompt, tags)
+    _do_fill(
+        deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run,
+        model_name, api_base, count, batch, raw_prompt, tags, filter_expr,
+        tag_add, tag_delete, validate_filter_expr,
+    )
 
 
 @app.command()
@@ -691,6 +712,11 @@ def show(
         "--filter",
         help='Jinja filter on field values, e.g. \'cantonese is empty or word == sentence\'',
     ),
+    fields: str | None = typer.Option(
+        None,
+        "--fields",
+        help="Fields to display (comma-separated). With -F, defaults to filter fields; prefix + to add",
+    ),
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to show (0 = no limit)"),
     full: bool = typer.Option(False, "-f", "--full", help="Show full field content (not truncated)"),
 ) -> None:
@@ -702,7 +728,11 @@ def show(
       ankiman show -g "to_review" -l 10
       ankiman show -d 3 -g "important" --full
       ankiman show -d 2 -F 'cantonese is empty'
-      ankiman show -d 2 -F 'word in sentence or word is split_word_in(sentence)'
+      ankiman show -d 2 -F 'word in sentence' --fields +Audio,+Key
+      ankiman show -d 3 -F 'Cantonese is not split_word_in(SentenceCantonese)' --fields +Jyutping
+
+    With -F, only fields referenced in the filter are shown by default.
+    Use --fields to override, or prefix with + to add fields (e.g. --fields +Audio,+Key).
 
     Field names are case-insensitive. Custom tests: empty, split_word_in (chars in order, gaps ok).
     """
@@ -737,20 +767,108 @@ def show(
     if count > 0:
         notes = notes[:count]
 
-    logger.info(f"Showing {len(notes)} note(s)")
+    available_fields: set[str] = set()
+    for note in notes:
+        available_fields.update(extract_field_values(note).keys())
+    show_fields = resolve_show_fields(fields, filter_expr, sorted(available_fields))
+
+    logger.info(f"Showing {len(notes)} note(s)", fields=show_fields)
 
     for note in notes:
         note_id = note["noteId"]
-        fields = extract_field_values(note)
+        fields_map = extract_field_values(note)
         note_tags = note.get("tags", [])
         model = note.get("modelName", "?")
 
         display_fields: dict[str, str] = {}
-        for name, value in fields.items():
+        for name in show_fields:
+            value = fields_map.get(name, "")
             display_fields[name] = value if full else preview_field_text(value)
 
         tag_str = f" [{', '.join(note_tags)}]" if note_tags else ""
         logger.info(f"Note {note_id} ({model}){tag_str}", **display_fields)
+
+
+_LANG_HELP = f"TTS language ({', '.join(language_choices())})"
+
+
+@audio_app.command(name="languages")
+def audio_languages() -> None:
+    """List supported --language values and default edge-tts voices."""
+    by_canonical: dict[str, list[str]] = {}
+    for alias, canonical in LANGUAGE_ALIASES.items():
+        by_canonical.setdefault(canonical, []).append(alias)
+    for canonical in sorted(by_canonical):
+        aliases = ", ".join(sorted(by_canonical[canonical]))
+        logger.info(canonical, aliases=aliases, default_voice=DEFAULT_VOICES[canonical])
+
+
+@audio_app.command(name="fill")
+def audio_fill(
+    language: str = typer.Option(..., "-L", "--language", help=_LANG_HELP),
+    deck: str | None = typer.Option(None, "-d", "--deck", help="Deck index or exact name"),
+    tags: str | None = typer.Option(None, "-g", "--tags", help="Filter by tags (comma-separated, OR logic)"),
+    filter_expr: str | None = typer.Option(None, "-F", "--filter", help="Jinja filter on field values"),
+    text_field: str = typer.Option("Cantonese", "--text-field", help="Field with text to synthesize"),
+    audio_field: str = typer.Option("Audio", "--field", help="Anki field to store [sound:...] reference"),
+    filename_template: str = typer.Option(
+        "canto_word_{Key}.mp3",
+        "--filename-template",
+        help="Media filename template ({Field} placeholders)",
+    ),
+    voice: str | None = typer.Option(None, "--voice", help="Override default edge-tts voice for this language"),
+    force: bool = typer.Option(False, "-f", "--force", help="Regenerate even when audio field is filled"),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run", help="Preview without writing to Anki"),
+    tag_add: str | None = typer.Option(None, "-ta", "--tag-add", help="Add tag(s) after successful write"),
+    tag_delete: str | None = typer.Option(None, "-td", "--tag-delete", help="Remove tag(s) after successful write"),
+    count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to process (0 = no limit)"),
+    delay: float = typer.Option(0.0, "-w", "--wait", help="Seconds between notes"),
+) -> None:
+    """Generate MP3 via edge-tts and update Anki media + audio field.
+
+    \b
+    Examples:
+      ankiman audio test 落雨 --language cantonese --play
+      ankiman audio fill --language cantonese -g audio-pending -td audio-pending
+      ankiman audio fill --language mandarin --text-field MandarinAnalogue -l 5 -n
+    """
+    _do_audio_fill(
+        deck=deck,
+        tags=tags,
+        filter_expr=filter_expr,
+        text_field=text_field,
+        audio_field=audio_field,
+        filename_template=filename_template,
+        language=language,
+        voice=voice,
+        force=force,
+        dry_run=dry_run,
+        tag_add=tag_add,
+        tag_delete=tag_delete,
+        count=count,
+        delay=delay,
+    )
+
+
+@audio_app.command(name="test")
+def audio_test(
+    text: str = typer.Argument(help="Text to synthesize"),
+    language: str = typer.Option(..., "-L", "--language", help=_LANG_HELP),
+    voice: str | None = typer.Option(None, "--voice", help="Override default edge-tts voice for this language"),
+    output: Path = typer.Option(Path("test-output.mp3"), "-o", "--output", help="Output MP3 path"),
+    play: bool = typer.Option(False, "--play", help="Play the MP3 after synthesis (afplay on macOS)"),
+) -> None:
+    """Synthesize one phrase to a file (no Anki write).
+
+    \b
+    Examples:
+      ankiman audio test 你好 --language mandarin --play
+      ankiman audio test 落雨 --language cantonese --play
+      ankiman audio test hello --language english --voice en-US-GuyNeural
+    """
+    lang, resolved_voice = resolve_voice(language=language, voice=voice)
+    logger.info("Synthesizing", language=lang, voice=resolved_voice, text=text)
+    _do_audio_test(text, language=language, voice=voice, output_path=output, play=play)
 
 
 def main() -> None:
