@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import resource
@@ -9,8 +10,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
 import typer
-from loguru import logger
 
 from .anki import (
     AnkiConnectClient,
@@ -19,10 +20,13 @@ from .anki import (
     preview_field_text,
     resolve_deck_name,
 )
-from .config import AppConfig, ModelConfig, config_path, ensure_api_key, load_config, save_config
+from .config import AppConfig, ModelConfig, config_path, default_env_var, ensure_api_key, load_config, reset_config, save_config
+from .secrets import delete_secret, secret_backend_name, set_secret
 from .llm import LLMClient, check_balance, parse_ai_response
 
 PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+logger = structlog.get_logger()
 
 
 def extract_source_fields(prompt: str) -> list[str]:
@@ -45,6 +49,17 @@ def replace_placeholders(text: str, field_map: dict[str, str]) -> str:
 
 def parse_comma_list(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def build_anki_query(deck: str | None, tags: list[str] | None) -> str:
+    """Build an AnkiConnect search query from deck name and/or tags."""
+    parts: list[str] = []
+    if deck:
+        parts.append(f'deck:"{deck}"')
+    if tags:
+        tag_clauses = " OR ".join(f'tag:"{t}"' for t in tags)
+        parts.append(f"({tag_clauses})")
+    return " ".join(parts)
 
 
 def count_nonempty(values: dict[str, str], names: list[str]) -> int:
@@ -116,21 +131,21 @@ def _do_ping(check_key: bool, config: str | None) -> None:
     client = AnkiConnectClient()
     ver = client.version()
     decks = client.deck_names()
-    logger.info("AnkiConnect OK (version {}) — {} deck(s)", ver, len(decks))
+    logger.info(f"AnkiConnect OK (version {ver}) — {len(decks)} deck(s)")
     if check_key:
         app_cfg = load_config()
         model_cfg = app_cfg.resolve(config)
         key = ensure_api_key(model_cfg.api_key_env, prompt=False)
-        logger.info("API key {} is set ({}…)", model_cfg.api_key_env, key[:4])
+        logger.info(f"API key {model_cfg.api_key_env} is set ({key[:4]}…)")
 
 
 def _do_deck_list() -> None:
     client = AnkiConnectClient()
     names = sorted(client.deck_names())
-    logger.info("{:>3}  {:<40}  Notes", "#", "Deck")
+    logger.info(f"{'#':>3}  {'Deck':<40}  Notes")
     for i, name in enumerate(names, start=1):
         count = len(client.find_notes(f'deck:"{name}"'))
-        logger.info("{:>3}  {:<40}  {}", i, name, count)
+        logger.info(f"{i:>3}  {name:<40}  {count}")
 
 
 def _do_deck_fields(deck: str) -> None:
@@ -138,7 +153,7 @@ def _do_deck_fields(deck: str) -> None:
     deck_name = resolve_deck_name(client, deck)
     note_ids = client.find_notes(f'deck:"{deck_name}"')
     if not note_ids:
-        logger.info("No notes in deck {!r}", deck_name)
+        logger.info(f"No notes in deck {deck_name!r}")
         return
 
     notes = client.notes_info(note_ids)
@@ -150,58 +165,123 @@ def _do_deck_fields(deck: str) -> None:
         entry["fields"].update(fields.keys())
 
     logger.info(
-        "Deck {!r}: {} note(s), {} note type(s)",
-        deck_name,
-        len(notes),
-        len(by_model),
+        f"Deck {deck_name!r}: {len(notes)} note(s), {len(by_model)} note type(s)"
     )
-    logger.info("Use these field names in prompt placeholders like {{Field}} and in --target-fields.")
+    logger.info(f"Use these field names in prompt placeholders like {{Field}} and in --target-fields.")
 
     for model in sorted(by_model):
         info = by_model[model]
         example_fields: dict[str, str] = info["example"]
-        logger.info("Note type: {}", model)
+        logger.info(f"Note type: {model}")
         for field_name in sorted(info["fields"]):
             logger.info(
-                "  {:<24} {}",
-                field_name,
-                preview_field_text(example_fields.get(field_name, "")),
+                f"  {field_name:<24} {preview_field_text(example_fields.get(field_name, ''))}"
             )
 
 
+def _prompt_model_add(
+    name: str | None,
+    model: str | None,
+    api_base: str | None,
+    api_key: str | None,
+    api_key_env: str,
+    set_default: bool | None,
+    force: bool,
+) -> tuple[str, str, str, str, str, bool, bool]:
+    cfg_path = config_path()
+    if cfg_path.is_file():
+        app_cfg = load_config(cfg_path)
+    else:
+        app_cfg = AppConfig(default_model="", models={})
+
+    interactive = name is None or model is None or api_base is None or api_key is None
+
+    if interactive:
+        typer.echo("Add a new LLM model to ankiman.\n")
+
+    if name is None:
+        name = typer.prompt("Config name (used with fill -c)").strip()
+    if not name:
+        raise SystemExit("Model name cannot be empty.")
+
+    if name in app_cfg.models and not force:
+        if interactive:
+            if not typer.confirm(f"Model {name!r} already exists. Overwrite?", default=False):
+                raise SystemExit("Aborted.")
+            force = True
+        else:
+            raise SystemExit(f"Model {name!r} already exists. Use --force to overwrite.")
+
+    if model is None:
+        model = typer.prompt("API model name (e.g. deepseek-chat)").strip()
+    if not model:
+        raise SystemExit("API model name cannot be empty.")
+
+    if api_base is None:
+        api_base = typer.prompt("API base URL (e.g. https://api.deepseek.com/v1)").strip().rstrip("/")
+    if not api_base:
+        raise SystemExit("API base URL cannot be empty.")
+
+    if not api_key_env:
+        api_key_env = default_env_var(name)
+        if interactive:
+            typer.echo(f"API key will be stored as {api_key_env!r} in {secret_backend_name()}.")
+
+    if api_key is None:
+        api_key = typer.prompt("API key", hide_input=True).strip()
+    if not api_key:
+        raise SystemExit("API key cannot be empty.")
+
+    if set_default is None:
+        if not app_cfg.models:
+            set_default = True
+        elif interactive:
+            set_default = typer.confirm("Set as default model?", default=True)
+        else:
+            set_default = False
+
+    return name, model, api_base.rstrip("/"), api_key, api_key_env, set_default, force
+
+
 def _do_model_add(
-    name: str,
-    model: str,
-    api_base: str,
+    name: str | None = None,
+    model: str | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
     api_key_env: str = "",
-    set_default: bool = False,
+    set_default: bool | None = None,
     force: bool = False,
 ) -> None:
+    name, model, api_base, api_key, api_key_env, set_default, force = _prompt_model_add(
+        name, model, api_base, api_key, api_key_env, set_default, force
+    )
+
     cfg_path = config_path()
     if cfg_path.is_file():
         app_cfg = load_config(cfg_path)
     else:
         app_cfg = AppConfig(default_model=name, models={})
-    if name in app_cfg.models and not force:
-        raise SystemExit(f"Model {name!r} already exists. Use --force to overwrite.")
+
     app_cfg.models[name] = ModelConfig(
         name=name,
         model=model,
-        api_base=api_base.rstrip("/"),
+        api_base=api_base,
         api_key_env=api_key_env,
     )
     if set_default:
         app_cfg.default_model = name
     save_config(app_cfg, cfg_path)
+    set_secret(api_key_env, api_key)
     logger.info(
-        "Saved model {name!r} (model={model!r}, api_base={api_base!r}) to {path}",
+        f"Saved model to {cfg_path}",
         name=name,
         model=model,
-        api_base=api_base.rstrip("/"),
-        path=cfg_path,
+        api_base=api_base,
+        api_key_ref=api_key_env,
+        api_key_store=secret_backend_name(),
     )
     if set_default:
-        logger.info("Default model set to {name!r}", name=name)
+        logger.info(f"Default model set to {name!r}")
 
 
 def _process_result(
@@ -215,27 +295,27 @@ def _process_result(
     eligible: int,
     client: AnkiConnectClient,
 ) -> None:
-    logger.log("DETAIL", "Note {} raw response:\n{}", note_id, raw)
+    logger.debug(f"Note {note_id} raw response:\n{raw}")
     try:
         updates = parse_ai_response(raw, tfields)
     except ValueError as exc:
         stats.errors += 1
-        logger.error("Note {}: {}", note_id, exc)
+        logger.error(f"Note {note_id}: {exc}")
         return
     stats.processed += 1
 
     tag = "[DRY RUN] " if dry_run else ""
     counter = f"[{stats.processed}/{eligible}]"
-    source_str = ", ".join(f"{name}={preview_field_text(fields.get(name, ''))}" for name in sfields)
-    target_str = ", ".join(f"{name}={preview_field_text(updates.get(name, ''))}" for name in tfields)
-    logger.info("{} {} {} -> {}", counter, tag, source_str, target_str)
+    source_kwargs = {name: preview_field_text(fields.get(name, '')) for name in sfields}
+    target_kwargs = {f"→{name}": preview_field_text(updates.get(name, '')) for name in tfields}
+    logger.info(f"{counter} {tag}", **source_kwargs, **target_kwargs)
 
     if not dry_run:
         try:
             client.update_note_fields(note_id, updates)
         except AnkiConnectError as exc:
             stats.errors += 1
-            logger.error("Failed to update note {}: {}", note_id, exc)
+            logger.error(f"Failed to update note {note_id}: {exc}")
 
 
 def _do_fill(
@@ -252,15 +332,17 @@ def _do_fill(
     count: int = 0,
     batch: int = 1,
     raw_prompt: bool = False,
+    tags: str | None = None,
 ) -> None:
     app_cfg = load_config()
     model_cfg = app_cfg.resolve(config)
     tfields = parse_comma_list(target_fields)
     sfields = extract_source_fields(prompt)
+    tag_list = parse_comma_list(tags) if tags else None
     if not tfields:
         raise SystemExit("--target-fields must list at least one field")
     if not sfields:
-        logger.warning("Prompt contains no {{Field}} placeholders")
+        logger.warning("Prompt contains no {Field} placeholders")
 
     if not raw_prompt:
         import json
@@ -268,13 +350,17 @@ def _do_fill(
         json_template = json.dumps({f: "..." for f in tfields})
         prompt = f"{prompt}\nReturn JSON: {json_template}"
 
-    logger.info(f"Prompt:\n{prompt!r}", )
+    logger.info(f"Prompt:\n{prompt!r}")
 
     client = AnkiConnectClient()
     deck_name = resolve_deck_name(client, deck)
-    note_ids = client.find_notes(f'deck:"{deck_name}"')
+    query = build_anki_query(deck_name, tag_list)
+    note_ids = client.find_notes(query)
     if not note_ids:
-        logger.info("No notes in deck {deck!r}", deck=deck_name)
+        filters = [f"deck={deck_name!r}"]
+        if tag_list:
+            filters.append(f"tags={tag_list}")
+        logger.info("No notes found", filter=", ".join(filters))
         return
 
     notes = client.notes_info(note_ids)
@@ -294,18 +380,18 @@ def _do_fill(
     eligible = total_notes - skipped_source - skipped_target
 
     logger.info(
-        "Deck {deck!r}: {total} notes, sources={sources}, targets={targets}, model={model}",
-        deck=deck_name,
-        total=total_notes,
+        f"Deck {deck_name!r}",
+        notes=total_notes,
         sources=sfields,
         targets=tfields,
         model=config or app_cfg.default_model,
+        tags=tag_list or [],
     )
     logger.info(
-        "Pre-scan: {eligible} eligible, {skipped_source} skipped (source empty), {skipped_target} skipped (target filled)",
+        "Pre-scan",
         eligible=eligible,
-        skipped_source=skipped_source,
-        skipped_target=skipped_target,
+        source_empty=skipped_source,
+        target_filled=skipped_target,
     )
 
     if eligible == 0:
@@ -343,12 +429,12 @@ def _do_fill(
             # Sequential: simple single-note path
             note_id, fields, source_vals = batch_notes[0]
             compiled = replace_placeholders(prompt, source_vals)
-            logger.log("DETAIL", "Note {} prompt:\n{}", note_id, compiled)
+            logger.debug(f"Note {note_id} prompt:\n{compiled}")
             try:
                 raw = llm.complete(compiled)
             except RuntimeError as exc:
                 stats.errors += 1
-                logger.error("Note {}: {}", note_id, exc)
+                logger.error(f"Note {note_id}: {exc}")
                 continue
             _process_result(note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client)
         else:
@@ -360,7 +446,7 @@ def _do_fill(
             try:
                 for note_id, fields, source_vals in batch_notes:
                     compiled = replace_placeholders(prompt, source_vals)
-                    logger.log("DETAIL", "Note {} prompt:\n{}", note_id, compiled)
+                    logger.debug(f"Note {note_id} prompt:\n{compiled}")
                     futures[executor.submit(llm.complete, compiled)] = (note_id, fields)
 
                 for future in as_completed(futures):
@@ -369,7 +455,7 @@ def _do_fill(
                         raw = future.result()
                     except RuntimeError as exc:
                         stats.errors += 1
-                        logger.error("Note {}: {}", note_id, exc)
+                        logger.error(f"Note {note_id}: {exc}")
                         continue
                     _process_result(note_id, fields, raw, tfields, sfields, dry_run, stats, eligible, client)
             except KeyboardInterrupt:
@@ -384,18 +470,23 @@ def _do_fill(
 
         # Note: count limit is handled by eligible_notes slicing above
         if count > 0 and len(eligible_notes) >= count and batch_idx >= count:
-            logger.info("Reached count limit ({}) — stopping.", count)
+            logger.info("Count limit reached — stopping", limit=count)
             break
 
     logger.info(
-        "Done. processed={processed} skipped={skipped} errors={errors} total={total}",
-        **stats.__dict__,
+        "Done",
+        processed=stats.processed,
+        skipped=stats.skipped,
+        errors=stats.errors,
+        total=stats.total,
     )
 
 
 app = typer.Typer(no_args_is_help=True)
+config_app = typer.Typer(no_args_is_help=True)
 deck_app = typer.Typer(no_args_is_help=True)
 model_app = typer.Typer(no_args_is_help=True)
+app.add_typer(config_app, name="config", help="Manage ankiman config")
 app.add_typer(deck_app, name="deck", help="Deck operations")
 app.add_typer(model_app, name="model", help="Manage LLM models")
 
@@ -407,6 +498,44 @@ def ping(
 ) -> None:
     """Test AnkiConnect connection."""
     _do_ping(check_key, config)
+
+
+@config_app.command(name="reset")
+def config_reset(
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    keys: bool = typer.Option(False, "--keys", help="Also delete stored API keys for configured models"),
+) -> None:
+    """Remove .ankiman_config.yaml (for dev/debugging).
+
+    \b
+    Example:
+      ankiman config reset -y
+      ankiman config reset -y --keys
+    """
+    cfg_path = config_path()
+    if not cfg_path.is_file():
+        logger.info(f"No config at {cfg_path}")
+        return
+
+    prompt = f"Delete {cfg_path.name}"
+    if keys:
+        prompt += " and stored API keys"
+    prompt += "?"
+
+    if not yes and not typer.confirm(prompt, default=False):
+        raise SystemExit("Aborted.")
+
+    key_refs = reset_config(delete_keys=keys)
+    logger.info(f"Removed {cfg_path}")
+
+    if keys:
+        removed = 0
+        for ref in key_refs:
+            if delete_secret(ref):
+                removed += 1
+                logger.info(f"Removed API key {ref!r} from {secret_backend_name()}")
+        if key_refs and removed == 0:
+            logger.info("No stored API keys found to remove")
 
 
 @deck_app.command(name="list")
@@ -430,32 +559,36 @@ def deck_fields(
 
 @model_app.command(name="add")
 def model_add(
-    name: str = typer.Argument(help="Saved model name to use later with fill -c"),
-    model: str = typer.Option(
-        ...,
+    name: str | None = typer.Argument(None, help="Saved model name to use later with fill -c"),
+    model: str | None = typer.Option(
+        None,
         "-m",
         "--model",
         help="LLM model name (e.g. deepseek-chat)",
     ),
-    api_base: str = typer.Option(
-        ...,
+    api_base: str | None = typer.Option(
+        None,
         "--api-base",
         help="API base URL (e.g. https://api.deepseek.com/v1)",
     ),
-    api_key_env: str = typer.Option("", "--api-key-env", help="Env var for the API key (default: NAME_API_KEY derived from model name)"),
-    set_default: bool = typer.Option(False, "--set-default", help="Set as default model"),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key (prompted if omitted)"),
+    api_key_env: str = typer.Option("", "--api-key-env", help="Secret key name (default: NAME_API_KEY)"),
+    set_default: bool | None = typer.Option(None, "--set-default/--no-set-default", help="Set as default model"),
     force: bool = typer.Option(False, "--force", help="Overwrite existing model name"),
 ) -> None:
-    """Add a saved LLM model to .ankiman_config.yaml.
+    """Add a saved LLM model interactively or from flags.
 
     \b
-    Example:
-      ankiman model add deepseek --model deepseek-chat --api-base https://api.deepseek.com/v1 --set-default
+    Interactive (prompts for each value):
+      ankiman model add
 
-    The env var for the API key is auto-derived from the model name (e.g. DEEPSEEK_API_KEY).
-    Override with --api-key-env.
+    \b
+    Non-interactive:
+      ankiman model add deepseek --model deepseek-chat --api-base https://api.deepseek.com/v1 --api-key sk-... --set-default
+
+    On macOS the API key is stored in Keychain; on other platforms it is saved to .env.
     """
-    _do_model_add(name, model, api_base, api_key_env, set_default, force)
+    _do_model_add(name, model, api_base, api_key, api_key_env, set_default, force)
 
 
 @model_app.command(name="list")
@@ -463,8 +596,12 @@ def model_list() -> None:
     """List all configured models."""
     app_cfg = load_config()
     for name, mc in app_cfg.models.items():
-        default_mark = " [default]" if name == app_cfg.default_model else ""
-        logger.info("{}{} model={} api_base={}", name, default_mark, mc.model, mc.api_base)
+        default_mark = " *" if name == app_cfg.default_model else ""
+        logger.info(
+            f"{name}{default_mark}",
+            model=mc.model,
+            api_base=mc.api_base,
+        )
     if not app_cfg.models:
         logger.info("No models configured. Add one with: ankiman model add <name> ...")
 
@@ -481,7 +618,7 @@ def model_default(
         raise SystemExit(f"Unknown model {name!r}. Available: {available}")
     app_cfg.default_model = name
     save_config(app_cfg, cfg_path)
-    logger.info("Default model set to {name!r}", name=name)
+    logger.info(f"Default model set to {name!r}")
 
 
 @model_app.command(name="balance")
@@ -495,9 +632,7 @@ def model_balance(
         balances = check_balance(model_cfg)
     except RuntimeError as exc:
         raise SystemExit(str(exc))
-    logger.info("Balance for {name!r}:", name=config or app_cfg.default_model)
-    for currency, info in balances.items():
-        logger.info("  {}: {}", currency, info)
+    logger.info(f"Balance for {config or app_cfg.default_model!r}", **balances)
 
 
 @app.command()
@@ -515,6 +650,7 @@ def fill(
     api_base: str | None = typer.Option(None, "--api-base", help="Override API base URL for this run"),
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to process (0 = no limit)"),
     raw_prompt: bool = typer.Option(False, "-r", "--raw-prompt", help="Disable auto-generated JSON instruction in prompt"),
+    tags: str | None = typer.Option(None, "-g", "--tags", help="Filter by tags (comma-separated, OR logic)"),
 ) -> None:
     """Fill target fields from LLM responses.
 
@@ -530,7 +666,59 @@ def fill(
     Find deck numbers with: ankiman deck list
     Find field names with:      ankiman deck fields -d DECK
     """
-    _do_fill(deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run, model_name, api_base, count, batch, raw_prompt)
+    _do_fill(deck, prompt, target_fields, config, force, allow_partial_source, delay, dry_run, model_name, api_base, count, batch, raw_prompt, tags)
+
+
+@app.command()
+def show(
+    deck: str | None = typer.Option(None, "-d", "--deck", help="Deck index or exact name"),
+    tags: str | None = typer.Option(None, "-g", "--tags", help="Filter by tags (comma-separated, OR logic)"),
+    count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to show (0 = no limit)"),
+    full: bool = typer.Option(False, "-f", "--full", help="Show full field content (not truncated)"),
+) -> None:
+    """Show notes with their field values and tags.
+
+    \b
+    Examples:
+      ankiman show -d 2 -l 5
+      ankiman show -g "to_review" -l 10
+      ankiman show -d 3 -g "important" --full
+    """
+    client = AnkiConnectClient()
+    tag_list = parse_comma_list(tags) if tags else None
+    deck_name = resolve_deck_name(client, deck) if deck else None
+
+    if not deck and not tag_list:
+        raise SystemExit("Specify at least --deck or --tags")
+
+    query = build_anki_query(deck_name, tag_list)
+    note_ids = client.find_notes(query)
+
+    if not note_ids:
+        filters = [f"deck={deck_name or '?'!r}"]
+        if tag_list:
+            filters.append(f"tags={tag_list}")
+        logger.info("No notes found", filter=", ".join(filters))
+        return
+
+    if count > 0:
+        note_ids = note_ids[:count]
+
+    notes = client.notes_info(note_ids)
+    logger.info(f"Showing {len(notes)} note(s)")
+
+    for note in notes:
+        note_id = note["noteId"]
+        fields = extract_field_values(note)
+        note_tags = note.get("tags", [])
+        model = note.get("modelName", "?")
+
+        display_fields: dict[str, str] = {}
+        for name, value in fields.items():
+            display_fields[name] = value if full else preview_field_text(value)
+
+        tag_str = f" [{', '.join(note_tags)}]" if note_tags else ""
+        logger.info(f"Note {note_id} ({model}){tag_str}", **display_fields)
 
 
 def main() -> None:
@@ -544,21 +732,29 @@ def main() -> None:
         else:
             filtered.append(arg)
     sys.argv = [sys.argv[0]] + filtered
-    logger.remove()
-
-    try:
-        logger.level("DETAIL", no=15, color="<cyan>")
-    except Exception:
-        pass
 
     if v_count == 0:
-        level = "INFO"
-    elif v_count == 1:
-        level = "DETAIL"
+        min_level = logging.INFO
     else:
-        level = "DEBUG"
+        min_level = logging.DEBUG
 
-    logger.add(sys.stderr, level=level, format="<green>{time:HH:mm:ss}</green> <level>{level:<7}</level> {message}")
+    shared_processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.dev.set_exc_info,
+        structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=False),
+        structlog.dev.ConsoleRenderer(colors=True),
+    ]
+
+    structlog.configure(
+        processors=shared_processors,
+        wrapper_class=structlog.make_filtering_bound_logger(min_level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=True,
+    )
+
     signal.signal(signal.SIGINT, lambda _signum, _frame: os._exit(1))
 
     # Raise FD limit to avoid EMFILE under high concurrency.
@@ -572,7 +768,7 @@ def main() -> None:
     try:
         app()
     except AnkiConnectError as exc:
-        logger.error("{}", exc)
+        logger.error(str(exc))
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
         os._exit(1)

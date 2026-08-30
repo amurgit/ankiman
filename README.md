@@ -28,12 +28,19 @@ Add-on code: 2055492159
 After installing, restart Anki. AnkiConnect runs at `http://localhost:8765`.
 
 2. Start Anki with AnkiConnect enabled.
-3. Add an LLM model. This saves which model and API base `ankiman` should use:
+3. Add an LLM model. Run interactively (prompts for name, model, API base, and key):
+
+```bash
+uv run ankiman model add
+```
+
+Or pass everything as flags:
 
 ```bash
 uv run ankiman model add deepseek \
   --model deepseek-chat \
   --api-base https://api.deepseek.com/v1 \
+  --api-key sk-... \
   --set-default
 ```
 
@@ -66,7 +73,7 @@ uv run ankiman fill \
 
 `{Cantonese}` is replaced with real note values. The JSON format `{"MandarinAnalogue": "..."}` is auto-generated from `--target-fields`. The LLM response is parsed and written back to Anki. Use `--raw-prompt` to provide your own format instructions.
 
-If the API key is missing, `ankiman` asks for it and saves it to `.env`.
+If the API key is missing at runtime, `ankiman` prompts for it. On macOS keys are stored in Keychain; on other platforms they are saved to `.env`.
 
 ## Config
 
@@ -82,11 +89,13 @@ models:
     api_key_env: DEEPSEEK_API_KEY
 ```
 
-`.env`
+`.env` (non-macOS only, or legacy keys)
 
 ```dotenv
 DEEPSEEK_API_KEY=sk-...
 ```
+
+On macOS, keys live in Keychain under service `ankiman` instead.
 
 ## Main Commands
 
@@ -94,11 +103,12 @@ DEEPSEEK_API_KEY=sk-...
 uv run ankiman ping
 uv run ankiman deck list
 uv run ankiman deck fields -d DECK
-uv run ankiman model add MODEL --model API_MODEL --api-base URL [--set-default]
+uv run ankiman model add [NAME] [--model API_MODEL] [--api-base URL] [--api-key KEY] [--set-default]
 uv run ankiman model list
 uv run ankiman model default NAME
 uv run ankiman model balance [-c MODEL]
 uv run ankiman fill -d DECK -p PROMPT -t FIELD1,FIELD2
+uv run ankiman show [-d DECK] [-g TAGS] [-l N]
 ```
 
 Useful `fill` flags:
@@ -111,7 +121,8 @@ Useful `fill` flags:
 - `-b`, `--batch`: parallel LLM calls per batch (default 1 = sequential)
 - `-l`, `--limit-count`: process at most N notes (0 = all)
 - `-r`, `--raw-prompt`: disable auto-generated JSON format (provide your own)
-- `-v`, `-vv`: debug logs (`-v` prompts+responses, `-vv` +AnkiConnect payloads)
+- `-g`, `--tags`: filter by tags (comma-separated, OR logic)
+- `-v`, `-vv`: debug logs (`-v`/`-vv` show prompts, LLM responses, AnkiConnect payloads)
 
 ## Prompt Format
 
@@ -130,6 +141,26 @@ Return JSON: {"MandarinAnalogue": "..."}
 ```
 
 Use `--raw-prompt` to provide your own complete format instructions.
+
+## Show Command
+
+Browse notes with filtered queries:
+
+```bash
+uv run ankiman show -d 2 -l 5             # first 5 notes in deck 2
+uv run ankiman show -g "to_review" -l 10  # 10 notes with tag
+uv run ankiman show -d 3 -g "urgent"      # deck 3 + tag filter
+uv run ankiman show -d 2 -f               # show full field values (no truncation)
+```
+
+Show flags:
+
+- `-d`, `--deck`: filter by deck
+- `-g`, `--tags`: filter by tags (comma-separated, OR)
+- `-l`, `--limit-count`: show at most N notes
+- `-f`, `--full`: show full field content (not truncated)
+
+At least `--deck` or `--tags` is required.
 
 ## Notes
 
@@ -166,4 +197,5 @@ No checkpoint file — resume is field-based.
 - Anki integration: [`ankiman/anki.py`](ankiman/anki.py)
 - LLM integration: [`ankiman/llm.py`](ankiman/llm.py)
 - Config and models: [`ankiman/config.py`](ankiman/config.py)
+- Secret storage: [`ankiman/secrets/`](ankiman/secrets/)
 - Package config: [`pyproject.toml`](pyproject.toml)

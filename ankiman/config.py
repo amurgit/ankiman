@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from getpass import getpass
 from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv, set_key
-from loguru import logger
+import structlog
+
+from .secrets import ensure_secret
 
 CONFIG_FILENAME = ".ankiman_config.yaml"
 ENV_FILENAME = ".env"
+
+logger = structlog.get_logger()
 
 
 def default_env_var(model_name: str) -> str:
@@ -54,7 +56,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     if not path.is_file():
         raise SystemExit(
             f"Config not found: {path}\n"
-            f"Create one with: ankiman model add <name> --model <api-model> --api-base <url>"
+            f"Create one with: ankiman model add"
         )
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     default = raw.get("default")
@@ -95,26 +97,22 @@ def save_config(app: AppConfig, path: Path | None = None) -> None:
     path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False), encoding="utf-8")
 
 
+def ensure_api_key(env_var: str, *, prompt: bool = True) -> str:
+    return ensure_secret(env_var, prompt=prompt, path=env_path())
+
+
 def env_path(cwd: Path | None = None) -> Path:
     return (cwd or Path.cwd()) / ENV_FILENAME
 
 
-def ensure_api_key(env_var: str, *, prompt: bool = True) -> str:
-    load_dotenv(env_path())
-    import os
-
-    key = os.environ.get(env_var, "").strip()
-    if key:
-        return key
-    if not prompt:
-        raise SystemExit(f"Environment variable {env_var} is not set.")
-    logger.info(f"{env_var} not found — enter it now (saved to {ENV_FILENAME})")
-    key = getpass(f"{env_var}: ").strip()
-    if not key:
-        raise SystemExit(f"Empty API key for {env_var}.")
-    dotenv_file = env_path()
-    if not dotenv_file.is_file():
-        dotenv_file.write_text("", encoding="utf-8")
-    set_key(str(dotenv_file), env_var, key)
-    load_dotenv(dotenv_file, override=True)
-    return key
+def reset_config(*, delete_keys: bool = False) -> list[str]:
+    """Remove .ankiman_config.yaml. Returns api_key refs if delete_keys is True."""
+    path = config_path()
+    key_refs: list[str] = []
+    if not path.is_file():
+        return key_refs
+    if delete_keys:
+        app_cfg = load_config(path)
+        key_refs = sorted({mc.api_key_env for mc in app_cfg.models.values()})
+    path.unlink()
+    return key_refs
