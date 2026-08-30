@@ -22,7 +22,8 @@ from .anki import (
 )
 from .config import AppConfig, ModelConfig, config_path, default_env_var, ensure_api_key, load_config, reset_config, save_config
 from .secrets import delete_secret, secret_backend_name, set_secret
-from .llm import LLMClient, check_balance, parse_ai_response
+from .note_filter import filter_notes
+from .llm import LLMClient, check_balance, parse_ai_response, verify_api_access
 
 PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
@@ -251,10 +252,19 @@ def _do_model_add(
     api_key_env: str = "",
     set_default: bool | None = None,
     force: bool = False,
+    skip_check: bool = False,
 ) -> None:
     name, model, api_base, api_key, api_key_env, set_default, force = _prompt_model_add(
         name, model, api_base, api_key, api_key_env, set_default, force
     )
+
+    if not skip_check:
+        logger.info("Verifying API key…")
+        try:
+            verify_api_access(api_key=api_key, api_base=api_base, model=model)
+        except RuntimeError as exc:
+            raise SystemExit(f"API key verification failed: {exc}")
+        logger.info("API key verified")
 
     cfg_path = config_path()
     if cfg_path.is_file():
@@ -575,6 +585,7 @@ def model_add(
     api_key_env: str = typer.Option("", "--api-key-env", help="Secret key name (default: NAME_API_KEY)"),
     set_default: bool | None = typer.Option(None, "--set-default/--no-set-default", help="Set as default model"),
     force: bool = typer.Option(False, "--force", help="Overwrite existing model name"),
+    skip_check: bool = typer.Option(False, "--skip-check", help="Skip API key verification"),
 ) -> None:
     """Add a saved LLM model interactively or from flags.
 
@@ -586,9 +597,10 @@ def model_add(
     Non-interactive:
       ankiman model add deepseek --model deepseek-chat --api-base https://api.deepseek.com/v1 --api-key sk-... --set-default
 
+    Verifies the API key with a minimal completion request before saving.
     On macOS the API key is stored in Keychain; on other platforms it is saved to .env.
     """
-    _do_model_add(name, model, api_base, api_key, api_key_env, set_default, force)
+    _do_model_add(name, model, api_base, api_key, api_key_env, set_default, force, skip_check)
 
 
 @model_app.command(name="list")
@@ -673,6 +685,12 @@ def fill(
 def show(
     deck: str | None = typer.Option(None, "-d", "--deck", help="Deck index or exact name"),
     tags: str | None = typer.Option(None, "-g", "--tags", help="Filter by tags (comma-separated, OR logic)"),
+    filter_expr: str | None = typer.Option(
+        None,
+        "-F",
+        "--filter",
+        help='Jinja filter on field values, e.g. \'cantonese is empty or word == sentence\'',
+    ),
     count: int = typer.Option(0, "-l", "--limit-count", help="Limit how many notes to show (0 = no limit)"),
     full: bool = typer.Option(False, "-f", "--full", help="Show full field content (not truncated)"),
 ) -> None:
@@ -683,6 +701,10 @@ def show(
       ankiman show -d 2 -l 5
       ankiman show -g "to_review" -l 10
       ankiman show -d 3 -g "important" --full
+      ankiman show -d 2 -F 'cantonese is empty'
+      ankiman show -d 2 -F 'word in sentence or word is split_word_in(sentence)'
+
+    Field names are case-insensitive. Custom tests: empty, split_word_in (chars in order, gaps ok).
     """
     client = AnkiConnectClient()
     tag_list = parse_comma_list(tags) if tags else None
@@ -701,10 +723,20 @@ def show(
         logger.info("No notes found", filter=", ".join(filters))
         return
 
-    if count > 0:
-        note_ids = note_ids[:count]
-
     notes = client.notes_info(note_ids)
+    total = len(notes)
+
+    if filter_expr:
+        notes = filter_notes(notes, filter_expr)
+        logger.info(f"Filter matched {len(notes)}/{total} note(s)")
+
+    if not notes:
+        logger.info("No notes matched filter")
+        return
+
+    if count > 0:
+        notes = notes[:count]
+
     logger.info(f"Showing {len(notes)} note(s)")
 
     for note in notes:

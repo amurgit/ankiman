@@ -11,13 +11,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from loguru import logger
+import structlog
 
 from .config import ModelConfig, ensure_api_key
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE)
 MAX_API_RETRIES = 3
 RETRY_BASE = 2.0  # seconds base for exponential backoff
+
+logger = structlog.get_logger()
 
 # Per-run DNS cache to avoid repeated lookups overwhelming the resolver.
 _dns_cache: dict[tuple, list[tuple]] = {}
@@ -50,7 +52,7 @@ def _log_fd_diag() -> None:
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         fd_count = len(os.listdir("/dev/fd"))
-        logger.warning("FD diagnostic: open={} soft_limit={} hard_limit={}", fd_count, soft, hard)
+        logger.warning(f"FD diagnostic: open={fd_count} soft_limit={soft} hard_limit={hard}")
     except Exception:
         pass
 
@@ -116,6 +118,37 @@ def check_balance(
     return result
 
 
+def verify_api_access(*, api_key: str, api_base: str, model: str) -> None:
+    """Verify API key, base URL, and model with a minimal completion request."""
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    resp = None
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            },
+            timeout=30,
+        )
+        if resp.status_code == 401:
+            raise RuntimeError("invalid API key (HTTP 401)")
+        if resp.status_code == 404:
+            raise RuntimeError(f"model {model!r} not found or invalid API base URL (HTTP 404)")
+        resp.raise_for_status()
+        body = resp.json()
+        content = body.get("choices", [{}])[0].get("message", {}).get("content")
+        if content is None:
+            raise RuntimeError(f"unexpected API response: {body!r}")
+    except requests.RequestException as exc:
+        raise RuntimeError(_format_error_msg(exc)) from exc
+    finally:
+        if resp is not None:
+            resp.close()
+
+
 def strip_json_fences(text: str) -> str:
     text = text.strip()
     match = JSON_FENCE_RE.match(text)
@@ -151,12 +184,12 @@ class LLMClient:
             try:
                 if attempt:
                     wait = _retry_wait(attempt - 1)
-                    logger.debug("Retry {}/{} after {:.1f}s", attempt + 1, MAX_API_RETRIES, wait)
+                    logger.debug(f"Retry {attempt + 1}/{MAX_API_RETRIES} after {wait:.1f}s")
                     time.sleep(wait)
                 return self._call(prompt)
             except Exception as exc:
                 last_error = _format_error(exc)
-                logger.debug("API attempt {} failed: {}", attempt + 1, last_error)
+                logger.debug(f"API attempt {attempt + 1} failed: {last_error}")
         raise RuntimeError(f"API failed after {MAX_API_RETRIES} attempts: {last_error}")
 
     def _call(self, prompt: str) -> str:
